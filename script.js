@@ -5,13 +5,17 @@ const output = document.getElementById('output');
 const openaiOutput = document.getElementById('openai-output');
 
 let apiKey = '';
-let conversation = []; // Used to store the conversation context
-let recognition; // Defined in the global scope
-let isSpeaking = false; // Whether the system is currently speaking
-let interimTranscriptBuffer = ''; // Buffer to store interim results
-let synth = window.speechSynthesis; // Speech synthesis instance
+let conversation = [];
+let recognition;
+let isSpeaking = false;
+let synth = window.speechSynthesis;
+let audioContext;
+let analyser;
+let microphone;
+const VOLUME_THRESHOLD = 0.05; // 音量阈值，可以根据需要调整
+let lastInterruptTime = 0;
+const INTERRUPT_COOLDOWN = 1000; // 1秒冷却时间
 
-// Ensure the script runs after the DOM is fully loaded
 document.addEventListener('DOMContentLoaded', () => {
     fetch('config.json')
         .then(response => response.json())
@@ -22,27 +26,46 @@ document.addEventListener('DOMContentLoaded', () => {
             console.error('Error loading config:', error);
         });
 
+    initializeSpeechRecognition();
+    initializeAudioContext();
+
+    startButton.addEventListener('click', () => {
+        const selectedLanguage = languageSelect.value;
+        recognition.lang = selectedLanguage;
+        console.log(`Language set to: ${selectedLanguage}`);
+        recognition.start();
+        console.log('Recognition started');
+    });
+
+    stopButton.addEventListener('click', () => {
+        if (recognition) {
+            recognition.stop();
+            console.log('Recognition stopped');
+        }
+    });
+});
+
+function initializeSpeechRecognition() {
     recognition = new (window.SpeechRecognition || window.webkitSpeechRecognition)();
     recognition.interimResults = true;
     recognition.continuous = true;
 
-    let finalTranscript = '';
-
     recognition.onresult = (event) => {
         let interimTranscript = '';
+        let finalTranscript = '';
+
         for (let i = event.resultIndex; i < event.results.length; ++i) {
             if (event.results[i].isFinal) {
                 finalTranscript += event.results[i][0].transcript;
-                if (isSpeaking) {
-                    interimTranscriptBuffer += finalTranscript;
-                } else {
-                    sendToOpenAI(finalTranscript); // Send in segments
-                }
-                finalTranscript = ''; // Clear the sent text
+                handleSpeechInput(finalTranscript);
             } else {
                 interimTranscript += event.results[i][0].transcript;
+                if (isSpeaking && interimTranscript.length > 2) {
+                    handleSpeechInput(interimTranscript);
+                }
             }
         }
+
         output.innerHTML = `<p><strong>Interim:</strong> ${interimTranscript}</p><p><strong>Final:</strong> ${finalTranscript}</p>`;
     };
 
@@ -59,39 +82,64 @@ document.addEventListener('DOMContentLoaded', () => {
     recognition.onend = () => {
         console.log('Speech recognition service disconnected');
         output.innerHTML += `<p><strong>Status:</strong> Stopped</p>`;
-        if (!isSpeaking && interimTranscriptBuffer !== '') {
-            let bufferContent = interimTranscriptBuffer;
-            interimTranscriptBuffer = '';
-            sendToOpenAI(bufferContent); // Process buffered input
-        }
-        // Restart recognition to ensure continuous recognition
-        if (!isSpeaking && recognition) {
+        if (!isSpeaking) {
             recognition.start();
         }
     };
+}
 
-    startButton.addEventListener('click', () => {
-        const selectedLanguage = languageSelect.value;
-        recognition.lang = selectedLanguage; // Set language
-        console.log(`Language set to: ${selectedLanguage}`);
-        recognition.start();
-        console.log('Recognition started');
-    });
+function initializeAudioContext() {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioContext.createAnalyser();
+    
+    navigator.mediaDevices.getUserMedia({ audio: true })
+        .then(stream => {
+            microphone = audioContext.createMediaStreamSource(stream);
+            microphone.connect(analyser);
+            checkAudioLevel();
+        })
+        .catch(err => {
+            console.error('Error accessing microphone:', err);
+        });
+}
 
-    stopButton.addEventListener('click', () => {
-        if (recognition) {
-            recognition.stop();
-            recognition = null;
-            console.log('Recognition stopped');
+function checkAudioLevel() {
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+    
+    function check() {
+        analyser.getByteFrequencyData(dataArray);
+        const average = dataArray.reduce((acc, val) => acc + val, 0) / bufferLength;
+        const normalizedVolume = average / 256; // 将音量标准化到0-1范围
+        
+        if (isSpeaking && normalizedVolume > VOLUME_THRESHOLD) {
+            handleSpeechInput('');
         }
-    });
-});
+        
+        requestAnimationFrame(check);
+    }
+    
+    check();
+}
+
+function handleSpeechInput(input) {
+    if (isSpeaking) {
+        console.log('Interrupting current speech output');
+        synth.cancel();
+        isSpeaking = false;
+        if (input) {
+            sendToOpenAI(input);
+        }
+    } else if (input) {
+        sendToOpenAI(input);
+    }
+}
 
 async function sendToOpenAI(text) {
     const url = 'https://api.openai.com/v1/chat/completions';
-    openaiOutput.innerHTML += `<p><strong>Sending to OpenAI:</strong> ${text}</p>`; // Display the sent text
+    openaiOutput.innerHTML += `<p><strong>Sending to OpenAI:</strong> ${text}</p>`;
 
-    conversation.push({ "role": "user", "content": text }); // Add user's input to the conversation
+    conversation.push({ "role": "user", "content": text });
 
     try {
         const response = await fetch(url, {
@@ -104,7 +152,7 @@ async function sendToOpenAI(text) {
                 model: "gpt-3.5-turbo",
                 messages: [
                     { "role": "system", "content": "You are a helpful assistant." },
-                    ...conversation // Pass the complete conversation context
+                    ...conversation
                 ]
             })
         });
@@ -117,8 +165,8 @@ async function sendToOpenAI(text) {
         console.log('OpenAI response:', data);
         const responseText = data.choices[0].message.content;
         openaiOutput.innerHTML += `<p><strong>OpenAI:</strong> ${responseText}</p>`;
-        conversation.push({ "role": "assistant", "content": responseText }); // Add assistant's response to the conversation
-        speakText(responseText);  // Convert the response to speech
+        conversation.push({ "role": "assistant", "content": responseText });
+        speakText(responseText);
     } catch (error) {
         console.error('Error:', error);
         openaiOutput.innerHTML += `<p><strong>Error:</strong> ${error.message}</p>`;
@@ -127,46 +175,24 @@ async function sendToOpenAI(text) {
 
 function speakText(text) {
     if (isSpeaking) {
-        synth.cancel(); // Cancel current speech output
+        synth.cancel();
     }
     const utterThis = new SpeechSynthesisUtterance(text);
-    utterThis.lang = languageSelect.value;  // Set language
+    utterThis.lang = languageSelect.value;
+
     utterThis.onstart = () => {
-        isSpeaking = true; // Start speech output
+        isSpeaking = true;
         if (recognition) {
-            recognition.stop(); // Pause speech recognition to avoid recognizing its own speech
+            recognition.stop();
         }
     };
+
     utterThis.onend = () => {
-        isSpeaking = false; // End speech output
+        isSpeaking = false;
         if (recognition) {
-            recognition.start(); // Restart speech recognition
-        }
-        if (interimTranscriptBuffer !== '') {
-            let bufferContent = interimTranscriptBuffer;
-            interimTranscriptBuffer = '';
-            sendToOpenAI(bufferContent); // Process buffered input
+            recognition.start();
         }
     };
+
     synth.speak(utterThis);
 }
-
-// Cancel speech output and process new input
-function cancelSpeechAndProcessInput(input) {
-    if (isSpeaking) {
-        synth.cancel(); // Cancel current speech output
-        isSpeaking = false;
-        interimTranscriptBuffer += input; // Append new input to the buffer
-        let bufferContent = interimTranscriptBuffer;
-        interimTranscriptBuffer = '';
-        sendToOpenAI(bufferContent); // Process buffered input
-    } else {
-        sendToOpenAI(input); // Process input directly if no speech output is happening
-    }
-}
-
-// Ensure speech recognition restarts after speech ends
-recognition.onspeechend = () => {
-    console.log('Speech end detected, restarting recognition');
-    recognition.start(); // Restart speech recognition immediately
-};
