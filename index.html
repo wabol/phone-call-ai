@@ -4,6 +4,18 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI Conversation</title>
+    <style>
+        #output {
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .user-message {
+            color: blue;
+        }
+        .ai-message {
+            color: green;
+        }
+    </style>
 </head>
 <body>
     <select id="languageSelect">
@@ -12,6 +24,7 @@
     </select>
     <button id="startBtn">Start Conversation</button>
     <div id="output"></div>
+    <audio id="audioPlayer"></audio>
     <script src="app.js"></script>
 </body>
 </html>
